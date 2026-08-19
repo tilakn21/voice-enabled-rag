@@ -77,11 +77,20 @@ unlock voice input (Sarvam) and `grounded` mode (Anthropic).
 <summary>Manual steps instead of <code>run.sh</code></summary>
 
 ```bash
-python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+python3 -m venv .venv
+
+# CPU-only machine or container? Install torch from the CPU wheel index FIRST,
+# otherwise pip pulls ~2.5GB of unused CUDA libraries.
+.venv/bin/pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cpu
+
+.venv/bin/pip install -r requirements.txt
 .venv/bin/python scripts/prepare_corpus.py --languages hin --max-queries 1200
 .venv/bin/python scripts/build_index.py
 .venv/bin/python -m uvicorn voicerag.app:app --port 8000
 ```
+
+`anthropic` is only needed for `grounded` mode; `huggingface-hub` and `pyarrow`
+are only needed to build the corpus, not to serve it.
 </details>
 
 ---
