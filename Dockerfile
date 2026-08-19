@@ -1,12 +1,13 @@
 # CPU-only image. torch comes from the CPU wheel index so we don't ship ~2.5GB
 # of unused CUDA libraries.
-FROM python:3.12-slim AS base
+FROM python:3.12-slim
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
     HF_HOME=/app/.hf \
-    TOKENIZERS_PARALLELISM=false
+    TOKENIZERS_PARALLELISM=false \
+    EMBED_THREADS=2
 
 WORKDIR /app
 
@@ -23,24 +24,33 @@ COPY voicerag/ ./voicerag/
 COPY scripts/ ./scripts/
 COPY web/ ./web/
 COPY tests/ ./tests/
+RUN chmod +x scripts/entrypoint.sh
 
-# Bake the encoder into the image so the first request doesn't wait on a
-# 470MB download.
+# Bake the encoder weights in so the first request doesn't wait on a 470MB
+# download. This is cheap (~2 min) and always worth doing.
 RUN python -c "\
 from transformers import AutoModel, AutoTokenizer; \
 m='intfloat/multilingual-e5-small'; \
 AutoTokenizer.from_pretrained(m); AutoModel.from_pretrained(m)"
 
-# Build the corpus + index at image build time. Adjust --max-queries to trade
-# index size against build time; 1200 queries ≈ 39k passages ≈ 8 min on 4 cores.
-ARG MAX_QUERIES=1200
+# Corpus + index. Baking them in makes boot instant, but it downloads ~460MB
+# and takes ~5-15 min depending on MAX_QUERIES, which some hosts' build
+# timeouts won't tolerate. Set BUILD_INDEX=false to skip it — entrypoint.sh
+# then builds on first boot instead.
+ARG BUILD_INDEX=true
+ARG MAX_QUERIES=400
 ARG LANGUAGES=hin
-RUN python scripts/prepare_corpus.py --languages ${LANGUAGES} --max-queries ${MAX_QUERIES} \
- && python scripts/build_index.py \
- && rm -rf /app/.hf/datasets /root/.cache/huggingface/datasets
+RUN if [ "$BUILD_INDEX" = "true" ]; then \
+      python scripts/prepare_corpus.py --languages "$LANGUAGES" --max-queries "$MAX_QUERIES" && \
+      python scripts/build_index.py && \
+      rm -rf /app/.hf/datasets /root/.cache/huggingface/datasets ; \
+    else \
+      echo "skipping build-time index; entrypoint will build on first boot" ; \
+    fi
 
 EXPOSE 8000
-HEALTHCHECK --interval=30s --timeout=5s --start-period=90s --retries=3 \
-  CMD curl -fsS http://localhost:8000/v1/health || exit 1
+# start-period is generous because a boot-time index build can take minutes.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=600s --retries=3 \
+  CMD curl -fsS "http://localhost:${PORT:-8000}/v1/health" || exit 1
 
-CMD ["python", "-m", "uvicorn", "voicerag.app:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["./scripts/entrypoint.sh"]
