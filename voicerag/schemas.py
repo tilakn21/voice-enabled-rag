@@ -110,6 +110,10 @@ class QueryRequest(BaseModel):
     mode: Literal["fast", "grounded"] | None = None
     lang: str | None = None
     top_k: int | None = None
+    # Override the pipeline deadline for this request. Powers the latency dial
+    # in the UI: shrink it and watch the harness shed optional work and say so
+    # in `degraded_reason` rather than overrun.
+    budget_ms: float | None = None
 
 
 class Citation(BaseModel):
@@ -153,3 +157,9 @@ class QueryResponse(BaseModel):
     latency: LatencyBreakdown = Field(default_factory=LatencyBreakdown)
     degraded: bool = False
     degraded_reason: str | None = None
+    # Cross-lingual evidence: true when the answer was sourced from passages
+    # written in a different script than the question. This is the case the
+    # corpus is built for — a Hindi question answered from English text.
+    cross_lingual: bool = False
+    query_script: str | None = None
+    evidence_languages: list[str] = Field(default_factory=list)

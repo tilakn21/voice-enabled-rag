@@ -22,6 +22,7 @@ three produce an honest refusal rather than a degraded answer.
 from __future__ import annotations
 
 import logging
+import re
 import uuid
 
 from .config import Settings
@@ -35,6 +36,39 @@ from .stt import BaseSTT, Transcript
 from .telemetry import TelemetryStore, Timer
 
 logger = logging.getLogger(__name__)
+
+# Script detection is enough to spot cross-lingual answering here: the corpus
+# is Devanagari-script Hindi plus Latin-script English, so comparing the
+# question's script to the evidence's tells us whether the system bridged a
+# language the asker could not read.
+_SCRIPT_RANGES = (
+    ("Deva", (0x0900, 0x097F)), ("Beng", (0x0980, 0x09FF)),
+    ("Guru", (0x0A00, 0x0A7F)), ("Gujr", (0x0A80, 0x0AFF)),
+    ("Orya", (0x0B00, 0x0B7F)), ("Taml", (0x0B80, 0x0BFF)),
+    ("Telu", (0x0C00, 0x0C7F)), ("Knda", (0x0C80, 0x0CFF)),
+    ("Mlym", (0x0D00, 0x0D7F)), ("Arab", (0x0600, 0x06FF)),
+)
+
+
+def detect_script(text: str) -> str:
+    counts: dict[str, int] = {}
+    latin = 0
+    for ch in text:
+        code = ord(ch)
+        if not ch.isalpha():
+            continue
+        if code < 0x0250:
+            latin += 1
+            continue
+        for name, (lo, hi) in _SCRIPT_RANGES:
+            if lo <= code <= hi:
+                counts[name] = counts.get(name, 0) + 1
+                break
+    if counts:
+        best = max(counts, key=counts.get)
+        # Code-mixed input is common in Indic speech; report the majority.
+        return best if counts[best] >= latin else "Latn"
+    return "Latn" if latin else "unknown"
 
 
 class RagService:
@@ -104,6 +138,7 @@ class RagService:
         mode: str | None = None,
         lang: str | None = None,
         top_k: int | None = None,
+        budget_ms: float | None = None,
         timer: Timer | None = None,
         transcript: str | None = None,
         detected_language: str | None = None,
@@ -117,9 +152,11 @@ class RagService:
             logger.info("grounded mode requested but no LLM configured; using fast path")
             mode = "fast"
 
-        budget = Budget(
-            total_ms=cfg.grounded_budget_ms if mode == "grounded" else cfg.pipeline_budget_ms
-        )
+        default_budget = cfg.grounded_budget_ms if mode == "grounded" else cfg.pipeline_budget_ms
+        # A caller-supplied budget is clamped to something sane: below ~15ms
+        # not even the encoder fits, and an unbounded budget defeats the point.
+        budget_total = default_budget if budget_ms is None else max(15.0, min(budget_ms, 60_000.0))
+        budget = Budget(total_ms=budget_total)
 
         def respond(
             *,
@@ -133,6 +170,14 @@ class RagService:
             degraded: bool = False,
             degraded_reason: str | None = None,
         ) -> QueryResponse:
+            cites = citations or []
+            evidence_langs = sorted({c.lang for c in cites})
+            q_script = detect_script(query)
+            cross = any(
+                q_script != "unknown"
+                and not (lang.split("_")[-1] or "").startswith(q_script)
+                for lang in evidence_langs
+            )
             breakdown = timer.build(stt_ms=stt_ms)
             self.telemetry.record(breakdown, mode=mode)
             return QueryResponse(
@@ -144,13 +189,16 @@ class RagService:
                 answer=answer,
                 answered=answered,
                 abstain_reason=abstain_reason,
-                citations=citations or [],
+                citations=cites,
                 groundedness=groundedness,
                 confidence=confidence,
                 guardrails=report,
                 latency=breakdown,
                 degraded=degraded,
                 degraded_reason=degraded_reason,
+                cross_lingual=cross,
+                query_script=q_script,
+                evidence_languages=evidence_langs,
             )
 
         # ---- 1. input rails -------------------------------------------

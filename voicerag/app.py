@@ -24,6 +24,7 @@ from fastapi.responses import FileResponse, JSONResponse
 
 from .config import PROJECT_ROOT, get_settings
 from .embeddings import Encoder
+from .lab import ChunkingLab
 from .pipeline import RagService
 from .retrieval import Retriever
 from .schemas import QueryRequest, QueryResponse
@@ -38,7 +39,7 @@ logger = logging.getLogger("voicerag")
 
 WEB_DIR = PROJECT_ROOT / "web"
 
-_state: dict = {"service": None, "error": None}
+_state: dict = {"service": None, "lab": None, "error": None}
 
 
 @asynccontextmanager
@@ -66,6 +67,9 @@ async def lifespan(app: FastAPI):
 
         service = RagService(settings, encoder, retriever, stt=build_stt(settings))
         _state["service"] = service
+        # Optional: the all-8-strategy comparison index. Absent in a minimal
+        # deploy, in which case the lab tab reports itself unavailable.
+        _state["lab"] = ChunkingLab.load(settings, encoder)
         logger.info(
             "ready | %d chunks across %s | voice=%s | grounded=%s",
             retriever.n_chunks,
@@ -120,12 +124,16 @@ async def health():
             status_code=503,
             content={"status": "unhealthy", "error": _state.get("error", "starting")},
         )
+    lab = _state.get("lab")
     return {
         "status": "ok",
         "chunks": service.retriever.n_chunks,
         "strategies": list(service.retriever.shards),
         "voice_enabled": service.voice_enabled,
         "grounded_enabled": service.grounded_enabled,
+        "llm_model": service.settings.llm_model if service.grounded_enabled else None,
+        "lab_enabled": lab is not None,
+        "lab_strategies": lab.info["n_strategies"] if lab else 0,
     }
 
 
@@ -144,8 +152,42 @@ async def stats_reset():
 async def query(request: QueryRequest):
     service = get_service()
     return await service.answer(
-        request.query, mode=request.mode, lang=request.lang, top_k=request.top_k
+        request.query,
+        mode=request.mode,
+        lang=request.lang,
+        top_k=request.top_k,
+        budget_ms=request.budget_ms,
     )
+
+
+# --------------------------------------------------------------------------
+# Chunking Lab — the comparison the README can only describe
+# --------------------------------------------------------------------------
+def get_lab() -> ChunkingLab:
+    lab = _state.get("lab")
+    if lab is None:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Chunking lab index not built. Run:\n"
+                "  python scripts/build_lab_index.py"
+            ),
+        )
+    return lab
+
+
+@app.get("/v1/lab/info")
+async def lab_info():
+    lab = _state.get("lab")
+    if lab is None:
+        return {"available": False, "reason": "lab index not built"}
+    return lab.info
+
+
+@app.post("/v1/lab/race")
+async def lab_race(request: QueryRequest):
+    """Run one query through every chunking strategy and return each result."""
+    return get_lab().race(request.query, top_k=request.top_k or 3)
 
 
 @app.post("/v1/voice/query", response_model=QueryResponse)
