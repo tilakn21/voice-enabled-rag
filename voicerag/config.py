@@ -95,13 +95,25 @@ class Settings(BaseSettings):
 
     # ---------- generation ----------
     # "fast"    -> extractive synthesis only, no LLM call, sub-200ms budget
-    # "grounded"-> adds the Claude tool-calling harness on top
+    # "grounded"-> adds the LLM tool-calling harness on top
     default_mode: str = "fast"
-    anthropic_api_key: str | None = None
-    anthropic_model: str = "claude-opus-5"
-    anthropic_max_tokens: int = 2048
-    anthropic_effort: str = "low"
-    anthropic_timeout_s: float = 30.0
+    # Open-weight LLM over an OpenAI-compatible chat API. Provider-agnostic on
+    # purpose: base_url + model is the only thing that changes between Groq,
+    # Together, Fireworks, and a fully local Ollama / vLLM server, so the
+    # quality path can run with no vendor account at all.
+    #   Groq (default, free tier, fast):
+    #     https://api.groq.com/openai/v1   llama-3.3-70b-versatile
+    #     ...also openai/gpt-oss-20b, openai/gpt-oss-120b, qwen/qwen3-32b
+    #   Local, no key needed:
+    #     http://localhost:11434/v1        llama3.1:8b        (Ollama)
+    #     http://localhost:8000/v1         <served model>     (vLLM)
+    llm_base_url: str = "https://api.groq.com/openai/v1"
+    llm_model: str = "llama-3.3-70b-versatile"
+    llm_api_key: str | None = None
+    llm_max_tokens: int = 1024
+    # Extraction, not creative writing - keep it near-deterministic.
+    llm_temperature: float = 0.2
+    llm_timeout_s: float = 30.0
     llm_max_tool_iterations: int = 4
 
     # ---------- harness ----------

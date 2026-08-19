@@ -18,7 +18,7 @@ Reported separately:
 
 Usage:
     python scripts/bench_latency.py --n 300
-    python scripts/bench_latency.py --n 60 --mode grounded   # needs ANTHROPIC_API_KEY
+    python scripts/bench_latency.py --n 60 --mode grounded   # needs LLM_API_KEY
 """
 
 from __future__ import annotations

@@ -6,11 +6,13 @@ question. No model call, ~2ms, and grounded by construction: every token it
 emits came verbatim from a cited chunk. This is what keeps the end-to-end
 pipeline inside the 200ms target.
 
-`ClaudeSynthesizer` is the quality path. It runs a real tool-calling loop —
-Claude can re-search the corpus with a reformulated query, pull the full parent
-passage of a promising chunk, and must terminate by calling `submit_answer`
-with a structured payload naming its citations. Making the final answer a tool
-call rather than free text is what gives us schema-validated output out of an
+`LLMSynthesizer` is the quality path. It runs a real tool-calling loop against
+any OpenAI-compatible chat endpoint (Groq by default, but Together, Fireworks,
+or a fully local Ollama / vLLM server work unchanged): the model can re-search
+the corpus with a reformulated query, pull the full parent passage of a
+promising chunk, and must terminate by calling `submit_answer` with a
+structured payload naming its citations. Making the final answer a tool call
+rather than free text is what gives us schema-validated output out of an
 agentic loop, so the output guardrails have typed fields to check rather than
 prose to parse.
 
@@ -19,10 +21,12 @@ Both return an `AnswerPayload`, so the guardrail stage downstream is identical.
 
 from __future__ import annotations
 
+import json
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Sequence
 
+import httpx
 import numpy as np
 
 from .chunking import content_tokens as _content_tokens, split_sentences
@@ -209,7 +213,17 @@ class ExtractiveSynthesizer:
 
 
 # --------------------------------------------------------------------------
-# Quality path — Claude with tools
+# Quality path — an open-weight LLM with tools, over an OpenAI-compatible API
+#
+# Deliberately provider-agnostic rather than tied to one vendor: `llm_base_url`
+# plus `llm_model` is all that changes between Groq, Together, Fireworks, and a
+# fully local Ollama or vLLM server. That keeps the door open to running the
+# whole system offline with no API key at all.
+#
+# Groq is the default because it is free to start, serves open-weight models
+# (Llama, gpt-oss, Qwen), and is fast enough that the quality path stays
+# interactive — its synthesis latency dominates this path, so a slow provider
+# would make `grounded` mode unusable rather than merely slower.
 # --------------------------------------------------------------------------
 SYSTEM_PROMPT = """You answer questions strictly from a retrieved passage corpus \
 (MS MARCO, translated into Indic languages).
@@ -221,26 +235,13 @@ confident it is correct.
 sufficient=false. An honest "not in the corpus" is a correct answer here; a \
 plausible guess is a failure.
 - Answer in the same language as the question.
-- Be direct and brief — two sentences at most.
+- Be direct and brief - two sentences at most.
 - You must finish by calling submit_answer exactly once. Every citation_id you \
 pass must be a chunk_id that appeared in the context you were given or that a \
 search_corpus call returned.
 
 You may call search_corpus with a reformulated query if the initial passages \
 look off-target, and expand_context to see the full passage a chunk came from."""
-
-
-@dataclass
-class _ToolState:
-    retriever: object
-    settings: Settings
-    known: dict[str, RetrievedChunk] = field(default_factory=dict)
-    submitted: dict | None = None
-    tool_calls: list[str] = field(default_factory=list)
-
-    def register(self, chunks: Sequence[RetrievedChunk]) -> None:
-        for rc in chunks:
-            self.known[rc.chunk.chunk_id] = rc
 
 
 def _render_chunks(chunks: Sequence[RetrievedChunk]) -> str:
@@ -253,198 +254,267 @@ def _render_chunks(chunks: Sequence[RetrievedChunk]) -> str:
     return "\n\n".join(lines) if lines else "(no passages)"
 
 
-class ClaudeSynthesizer:
+# OpenAI-compatible function-tool schemas. `submit_answer` is the terminal tool:
+# making the final answer a *tool call* rather than free text is what gives us
+# schema-validated output out of an agentic loop, so the output guardrails get
+# typed fields to check instead of prose to parse.
+TOOL_SCHEMAS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "search_corpus",
+            "description": (
+                "Search the passage corpus again with a reformulated query. Use "
+                "when the passages already shown don't cover the question - for "
+                "example to try a synonym, a more specific entity, or the "
+                "English form of an Indic-language term."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "The reformulated search query."},
+                    "top_k": {
+                        "type": "integer",
+                        "description": "How many passages to return (1-10).",
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "expand_context",
+            "description": (
+                "Return the full source passage a chunk was cut from. Use when a "
+                "chunk looks relevant but is cut off mid-thought."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "chunk_id": {
+                        "type": "string",
+                        "description": "A chunk_id from the passages you have been shown.",
+                    }
+                },
+                "required": ["chunk_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "submit_answer",
+            "description": "Submit the final answer. Call this exactly once, last.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "answer": {
+                        "type": "string",
+                        "description": (
+                            "The answer, in the same language as the question. Two "
+                            "sentences maximum. If sufficient is false, briefly say "
+                            "the corpus does not cover the question."
+                        ),
+                    },
+                    "citation_ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "chunk_ids supporting the answer. Empty only when "
+                            "sufficient is false."
+                        ),
+                    },
+                    "sufficient": {
+                        "type": "boolean",
+                        "description": (
+                            "Whether the retrieved passages actually answer the question."
+                        ),
+                    },
+                },
+                "required": ["answer", "citation_ids", "sufficient"],
+            },
+        },
+    },
+]
+
+
+class LLMError(RuntimeError):
+    def __init__(self, message: str, status_code: int | None = None):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+class LLMSynthesizer:
+    """Tool-calling synthesis against any OpenAI-compatible chat endpoint."""
+
     def __init__(self, settings: Settings, retriever, fallback: ExtractiveSynthesizer):
         self.settings = settings
         self.retriever = retriever
         self.fallback = fallback
-        self._client = None
-        self._fallbacks_supported = True
 
     # ------------------------------------------------------------------
     @property
     def available(self) -> bool:
-        return bool(self.settings.anthropic_api_key)
+        # A local server (Ollama, vLLM) needs no key, so a configured non-remote
+        # base_url is enough on its own.
+        if self.settings.llm_api_key:
+            return True
+        return self._is_local(self.settings.llm_base_url)
 
-    def _get_client(self):
-        if self._client is None:
-            import anthropic
+    @staticmethod
+    def _is_local(url: str) -> bool:
+        return any(h in url for h in ("localhost", "127.0.0.1", "0.0.0.0", "host.docker.internal"))
 
-            self._client = anthropic.Anthropic(
-                api_key=self.settings.anthropic_api_key,
-                timeout=self.settings.anthropic_timeout_s,
-                max_retries=1,  # the harness owns retry policy
-            )
-        return self._client
+    @property
+    def provider_label(self) -> str:
+        host = self.settings.llm_base_url.split("//")[-1].split("/")[0]
+        return f"{host}:{self.settings.llm_model}"
 
     # ------------------------------------------------------------------
-    def synthesize(self, query: str, retrieved: Sequence[RetrievedChunk]) -> AnswerPayload:
-        from anthropic import beta_tool
+    async def synthesize(self, query: str, retrieved: Sequence[RetrievedChunk]) -> AnswerPayload:
+        cfg = self.settings
+        known: dict[str, RetrievedChunk] = {rc.chunk.chunk_id: rc for rc in retrieved}
+        submitted: dict | None = None
+        tool_calls_made: list[str] = []
 
-        state = _ToolState(retriever=self.retriever, settings=self.settings)
-        state.register(retrieved)
+        messages: list[dict] = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": (
+                    f"Question: {query}\n\n"
+                    f"Retrieved passages:\n{_render_chunks(retrieved)}\n\n"
+                    "Answer using only these passages, then call submit_answer."
+                ),
+            },
+        ]
 
-        @beta_tool
-        def search_corpus(query: str, top_k: int = 5) -> str:
-            """Search the passage corpus again with a reformulated query.
+        headers = {"Content-Type": "application/json"}
+        if cfg.llm_api_key:
+            headers["Authorization"] = f"Bearer {cfg.llm_api_key}"
+        url = cfg.llm_base_url.rstrip("/") + "/chat/completions"
 
-            Use when the passages already shown don't cover the question — for
-            example to try a synonym, a more specific entity, or the English
-            form of an Indic-language term.
+        async with httpx.AsyncClient(timeout=cfg.llm_timeout_s) as client:
+            for _ in range(cfg.llm_max_tool_iterations):
+                body = {
+                    "model": cfg.llm_model,
+                    "messages": messages,
+                    "tools": TOOL_SCHEMAS,
+                    "tool_choice": "auto",
+                    # Low temperature: this is extraction, not creative writing.
+                    "temperature": cfg.llm_temperature,
+                    "max_tokens": cfg.llm_max_tokens,
+                }
+                resp = await client.post(url, headers=headers, json=body)
+                if resp.status_code >= 400:
+                    raise LLMError(
+                        f"{self.provider_label} returned {resp.status_code}: {resp.text[:300]}",
+                        status_code=resp.status_code,
+                    )
 
-            Args:
-                query: The reformulated search query.
-                top_k: How many passages to return (1-10).
-            """
-            state.tool_calls.append("search_corpus")
-            result = state.retriever.retrieve(query, top_k=max(1, min(top_k, 10)))
-            state.register(result.chunks)
-            return _render_chunks(result.chunks)
+                choice = (resp.json().get("choices") or [{}])[0]
+                message = choice.get("message") or {}
+                calls = message.get("tool_calls") or []
 
-        @beta_tool
-        def expand_context(chunk_id: str) -> str:
-            """Return the full source passage a chunk was cut from.
+                if not calls:
+                    # Model answered in prose instead of calling submit_answer.
+                    break
 
-            Use when a chunk looks relevant but is cut off mid-thought.
+                # Echo the assistant turn back before appending tool results -
+                # OpenAI-compatible APIs reject tool results with no matching call.
+                messages.append(
+                    {
+                        "role": "assistant",
+                        "content": message.get("content") or "",
+                        "tool_calls": calls,
+                    }
+                )
 
-            Args:
-                chunk_id: A chunk_id from the passages you have been shown.
-            """
-            state.tool_calls.append("expand_context")
-            rc = state.known.get(chunk_id)
-            if rc is None:
-                return f"No chunk with id {chunk_id!r} is in scope."
-            chunk = rc.chunk
-            siblings = [
-                c
-                for c in state.retriever._chunk_by_id.values()  # noqa: SLF001
-                if c.doc_id == chunk.doc_id
-            ]
-            widest = max(siblings, key=lambda c: len(c.payload), default=chunk)
-            return f"[chunk_id={chunk.chunk_id}] full passage:\n{widest.payload}"
+                for call in calls:
+                    fn = (call.get("function") or {}).get("name") or ""
+                    tool_calls_made.append(fn)
+                    try:
+                        args = json.loads((call.get("function") or {}).get("arguments") or "{}")
+                    except json.JSONDecodeError:
+                        args = {}
 
-        @beta_tool
-        def submit_answer(answer: str, citation_ids: list[str], sufficient: bool) -> str:
-            """Submit the final answer. Call this exactly once, last.
+                    if fn == "search_corpus":
+                        result = self.retriever.retrieve(
+                            args.get("query") or query,
+                            top_k=max(1, min(int(args.get("top_k") or 5), 10)),
+                        )
+                        for rc in result.chunks:
+                            known[rc.chunk.chunk_id] = rc
+                        content = _render_chunks(result.chunks)
+                    elif fn == "expand_context":
+                        rc = known.get(args.get("chunk_id") or "")
+                        if rc is None:
+                            content = f"No chunk with id {args.get('chunk_id')!r} is in scope."
+                        else:
+                            siblings = [
+                                c
+                                for c in self.retriever._chunk_by_id.values()  # noqa: SLF001
+                                if c.doc_id == rc.chunk.doc_id
+                            ]
+                            widest = max(siblings, key=lambda c: len(c.payload), default=rc.chunk)
+                            content = f"[chunk_id={rc.chunk.chunk_id}] full passage:\n{widest.payload}"
+                    elif fn == "submit_answer":
+                        submitted = {
+                            "answer": args.get("answer") or "",
+                            "citation_ids": list(args.get("citation_ids") or []),
+                            "sufficient": bool(args.get("sufficient")),
+                        }
+                        content = "recorded"
+                    else:
+                        content = f"Unknown tool {fn!r}."
 
-            Args:
-                answer: The answer, in the same language as the question. Two
-                    sentences maximum. If sufficient is false, briefly say the
-                    corpus does not cover the question.
-                citation_ids: chunk_ids supporting the answer. Empty only when
-                    sufficient is false.
-                sufficient: Whether the retrieved passages actually answer the
-                    question.
-            """
-            state.tool_calls.append("submit_answer")
-            state.submitted = {
-                "answer": answer,
-                "citation_ids": list(citation_ids or []),
-                "sufficient": bool(sufficient),
-            }
-            return "recorded"
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": call.get("id") or fn,
+                            "name": fn,
+                            "content": content,
+                        }
+                    )
 
-        user_message = (
-            f"Question: {query}\n\n"
-            f"Retrieved passages:\n{_render_chunks(retrieved)}\n\n"
-            "Answer using only these passages, then call submit_answer."
-        )
+                if submitted is not None:
+                    break
 
-        request: dict = {
-            "model": self.settings.anthropic_model,
-            "max_tokens": self.settings.anthropic_max_tokens,
-            "system": SYSTEM_PROMPT,
-            "messages": [{"role": "user", "content": user_message}],
-            "tools": [search_corpus, expand_context, submit_answer],
-            # Adaptive thinking rather than disabled: with thinking off, Opus 5
-            # can emit a tool call as plain text, which would silently skip
-            # submit_answer. Low effort keeps the latency cost down.
-            "thinking": {"type": "adaptive"},
-            "output_config": {"effort": self.settings.anthropic_effort},
-        }
-        if self._fallbacks_supported:
-            request["betas"] = ["server-side-fallback-2026-07-01"]
-            request["fallbacks"] = "default"
-
-        client = self._get_client()
-        final = None
-        try:
-            final = self._drive(client, request, state)
-        except Exception as exc:  # noqa: BLE001
-            if self._fallbacks_supported and _looks_like_beta_rejection(exc):
-                # Older API surface: drop the fallback opt-in and try once more.
-                logger.warning("server-side fallbacks rejected (%s); retrying without", exc)
-                self._fallbacks_supported = False
-                request.pop("betas", None)
-                request.pop("fallbacks", None)
-                final = self._drive(client, request, state)
-            else:
-                raise
-
-        if final is not None and getattr(final, "stop_reason", None) == "refusal":
-            details = getattr(final, "stop_details", None)
-            category = getattr(details, "category", None)
-            logger.warning("model refused (category=%s)", category)
-            return AnswerPayload(
-                answer="I can't help with that request.",
-                answered=False,
-                abstain_reason=f"model_refusal:{category or 'unspecified'}",
+        if submitted is None:
+            # No structured submission. Rather than scraping prose, fall back to
+            # the deterministic extractive path, which is still correct.
+            logger.warning(
+                "submit_answer never called by %s (tools used: %s); extractive fallback",
+                self.provider_label,
+                tool_calls_made or "none",
             )
-
-        if state.submitted is None:
-            # The loop ended without a structured submission. Rather than
-            # scraping prose, fall back to the deterministic extractive path.
-            logger.warning("submit_answer was never called; using extractive fallback")
             payload = self.fallback.synthesize(query, retrieved)
             payload.abstain_reason = payload.abstain_reason or "llm_no_structured_output"
             return payload
 
-        return self._to_payload(state)
-
-    # ------------------------------------------------------------------
-    def _drive(self, client, request: dict, state: _ToolState):
-        runner = client.beta.messages.tool_runner(**request)
-        final = None
-        for i, message in enumerate(runner):
-            final = message
-            if state.submitted is not None:
-                break
-            if i + 1 >= self.settings.llm_max_tool_iterations:
-                logger.warning("tool loop hit iteration cap (%d)", i + 1)
-                break
-        return final
-
-    def _to_payload(self, state: _ToolState) -> AnswerPayload:
-        submitted = state.submitted or {}
-        if not submitted.get("sufficient", False):
+        if not submitted["sufficient"]:
             return AnswerPayload(
-                answer=submitted.get("answer") or ABSTAIN_TEXT,
+                answer=submitted["answer"] or ABSTAIN_TEXT,
                 answered=False,
                 abstain_reason="model_insufficient_context",
             )
 
         citations: list[Citation] = []
         cited_chunks: list[RetrievedChunk] = []
-        for cid in submitted.get("citation_ids", []):
-            rc = state.known.get(cid)
+        for cid in submitted["citation_ids"]:
+            rc = known.get(cid)
             if rc is not None:
                 citations.append(_citation(rc))
                 cited_chunks.append(rc)
-        # A model that answered but cited nothing valid gets caught by the
+        # A model that answered but cited nothing valid is caught by the
         # citation-validity rail; seeding with the top hit would launder that.
 
         return AnswerPayload(
-            answer=(submitted.get("answer") or "").strip(),
+            answer=submitted["answer"].strip(),
             answered=True,
             citations=citations,
             cited_chunks=cited_chunks,
             confidence=0.0,  # set by the output rails
         )
-
-
-def _looks_like_beta_rejection(exc: BaseException) -> bool:
-    text = f"{type(exc).__name__}: {exc}".lower()
-    return any(
-        marker in text
-        for marker in ("beta", "fallback", "unsupported", "unrecognized", "invalid_request")
-    )

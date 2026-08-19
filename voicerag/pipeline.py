@@ -4,7 +4,7 @@
                                                           │
                                             ┌─────────────┴──────────────┐
                                             ▼                            ▼
-                                   extractive (fast)          Claude + tools (grounded)
+                                   extractive (fast)        open LLM + tools (grounded)
                                             └─────────────┬──────────────┘
                                                           ▼
                                                    output rails ─▶ response
@@ -26,7 +26,7 @@ import uuid
 
 from .config import Settings
 from .embeddings import Encoder
-from .generation import ABSTAIN_TEXT, ClaudeSynthesizer, ExtractiveSynthesizer
+from .generation import ABSTAIN_TEXT, ExtractiveSynthesizer, LLMSynthesizer
 from .guardrails import InputRails, OutputRails, redact_pii
 from .harness import Budget, Harness
 from .retrieval import RetrievalResult, Retriever
@@ -63,7 +63,7 @@ class RagService:
             in_domain_cosine_threshold=settings.in_domain_cosine_threshold,
         )
         self.extractive = ExtractiveSynthesizer(encoder=encoder)
-        self.claude = ClaudeSynthesizer(settings, retriever, self.extractive)
+        self.llm = LLMSynthesizer(settings, retriever, self.extractive)
         self.telemetry = TelemetryStore(maxlen=settings.telemetry_ring_size)
 
     # ------------------------------------------------------------------
@@ -73,7 +73,7 @@ class RagService:
 
     @property
     def grounded_enabled(self) -> bool:
-        return self.claude.available
+        return self.llm.available
 
     # ------------------------------------------------------------------
     async def transcribe(self, audio: bytes, filename: str, content_type: str, timer: Timer):
@@ -114,7 +114,7 @@ class RagService:
         request_id = uuid.uuid4().hex[:12]
         mode = (mode or cfg.default_mode).lower()
         if mode == "grounded" and not self.grounded_enabled:
-            logger.info("grounded mode requested but ANTHROPIC_API_KEY unset; using fast path")
+            logger.info("grounded mode requested but no LLM configured; using fast path")
             mode = "fast"
 
         budget = Budget(
@@ -213,13 +213,13 @@ class RagService:
         degraded_reason = None
 
         if mode == "grounded":
-            payload: AnswerPayload = await self.harness.run_sync(
+            payload: AnswerPayload = await self.harness.run_stage(
                 "generate_llm",
-                lambda: self.claude.synthesize(clean_query, retrieval.chunks),
+                lambda: self.llm.synthesize(clean_query, retrieval.chunks),
                 timer=timer,
                 budget=budget,
                 retries=1,
-                breaker="anthropic",
+                breaker="llm",
                 fallback=None,
             )
             if payload is None:
@@ -323,7 +323,8 @@ class RagService:
             "config": {
                 "target_core_ms": self.settings.pipeline_budget_ms,
                 "embed_model": self.settings.embed_model,
-                "llm_model": self.settings.anthropic_model,
+                "llm_model": self.settings.llm_model,
+                "llm_endpoint": self.settings.llm_base_url,
                 "default_mode": self.settings.default_mode,
                 "voice_enabled": self.voice_enabled,
                 "grounded_enabled": self.grounded_enabled,

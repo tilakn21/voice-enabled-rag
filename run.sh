@@ -35,7 +35,7 @@ case "${1:-serve}" in
       echo "No index found. Run: ./run.sh setup" >&2
       exit 1
     fi
-    exec "$PY" -m uvicorn voicerag.app:app --host "${HOST:-0.0.0.0}" --port "${PORT:-8000}"
+    exec "$PY" -m uvicorn voicerag.app:app --host "${HOST:-0.0.0.0}" --port "${PORT:-8003}"
     ;;
   bench)
     ensure_venv
