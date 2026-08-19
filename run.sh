@@ -35,7 +35,24 @@ case "${1:-serve}" in
       echo "No index found. Run: ./run.sh setup" >&2
       exit 1
     fi
-    exec "$PY" -m uvicorn voicerag.app:app --host "${HOST:-0.0.0.0}" --port "${PORT:-8003}"
+    PORT="${PORT:-8000}"
+    # Starting a second server while an old one still holds the port is the
+    # classic "I redeployed but still see the old UI" trap: the new process
+    # fails to bind and the browser keeps talking to the stale one.
+    if pgrep -f "uvicorn voicerag.app" > /dev/null 2>&1; then
+      echo "==> stopping stale voice-rag server(s):"
+      pgrep -lf "uvicorn voicerag.app" | sed 's/^/    /'
+      pkill -f "uvicorn voicerag.app" || true
+      sleep 1
+    fi
+    if command -v lsof > /dev/null 2>&1 && lsof -i ":$PORT" -sTCP:LISTEN > /dev/null 2>&1; then
+      echo "Port $PORT is in use by something else:" >&2
+      lsof -i ":$PORT" -sTCP:LISTEN >&2
+      echo "Free it, or run: PORT=8010 ./run.sh serve" >&2
+      exit 1
+    fi
+    echo "==> http://localhost:$PORT   (hard-refresh the tab: Cmd/Ctrl+Shift+R)"
+    exec "$PY" -m uvicorn voicerag.app:app --host "${HOST:-0.0.0.0}" --port "$PORT"
     ;;
   bench)
     ensure_venv

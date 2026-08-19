@@ -238,10 +238,28 @@ async def voice_query(
 # --------------------------------------------------------------------------
 @app.get("/")
 async def index_page():
+    """Serve the demo UI.
+
+    Explicitly uncacheable: the page is a single hand-written HTML file with no
+    content hash in its URL, so a browser that caches it will happily show a
+    stale build after a redeploy. `no-store` costs nothing here (30KB, served
+    once per visit) and removes a whole category of "I redeployed but still see
+    the old UI" confusion.
+    """
     page = WEB_DIR / "index.html"
     if not page.exists():
         return JSONResponse({"service": "voice-rag", "docs": "/docs"})
-    return FileResponse(page)
+    return FileResponse(
+        page,
+        headers={
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+            "Expires": "0",
+            # Cheap build stamp so you can confirm which build is live:
+            #   curl -sI localhost:8000/ | grep x-ui-build
+            "X-UI-Build": str(int(page.stat().st_mtime)),
+        },
+    )
 
 
 def main() -> None:
