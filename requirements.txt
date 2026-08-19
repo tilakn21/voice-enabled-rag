@@ -1,0 +1,21 @@
+fastapi==0.141.1
+uvicorn[standard]==0.41.0
+python-multipart==0.0.22
+pydantic==2.11.10
+pydantic-settings==2.13.0
+httpx==0.28.1
+numpy==2.4.4
+scipy==1.17.1
+hnswlib==0.8.0
+# On a CPU-only deployment install torch from the CPU wheel index FIRST, or
+# pip pulls ~2.5GB of unused CUDA libraries:
+#   pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cpu
+torch==2.11.0
+transformers==5.5.4
+tokenizers==0.22.2
+safetensors==0.7.0
+# Optional — only needed for `grounded` mode
+anthropic==0.122.0
+# Corpus preparation only; not needed to serve
+huggingface-hub==1.11.0
+pyarrow==25.0.1

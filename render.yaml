@@ -1,0 +1,32 @@
+# Render blueprint. `render.com` -> New -> Blueprint -> point at this repo.
+#
+# The Docker build bakes the corpus, the index, and the encoder weights into
+# the image, so the running container needs no network at boot and the first
+# request doesn't pay a cold download. That makes the build slow (~10-15 min)
+# and the image large (~2.5GB); MAX_QUERIES is the dial for both.
+#
+# A free-tier instance has 512MB RAM, which is not enough for the encoder plus
+# a 39k-passage index — use at least the "standard" plan, or drop MAX_QUERIES
+# to ~300 for a smaller demo footprint.
+services:
+  - type: web
+    name: voice-rag
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: standard          # 2GB RAM; "starter" works with MAX_QUERIES<=400
+    healthCheckPath: /v1/health
+    dockerBuildArgs:
+      MAX_QUERIES: 1200
+      LANGUAGES: hin
+    envVars:
+      - key: PORT
+        value: 8000
+      - key: EMBED_THREADS
+        value: 2            # match the instance's core count
+      - key: DEFAULT_MODE
+        value: fast
+      # Set these in the Render dashboard, not here.
+      - key: SARVAM_API_KEY
+        sync: false
+      - key: ANTHROPIC_API_KEY
+        sync: false

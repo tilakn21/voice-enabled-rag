@@ -1,0 +1,41 @@
+{
+  "signal": "max_cosine",
+  "populations": {
+    "in_domain": {
+      "n": 250,
+      "min": 0.8413,
+      "p05": 0.8598,
+      "p50": 0.9056,
+      "p95": 0.9484,
+      "max": 0.9627
+    },
+    "unanswerable": {
+      "n": 18,
+      "min": 0.8017,
+      "p05": 0.8302,
+      "p50": 0.8643,
+      "p95": 0.889,
+      "max": 0.9086
+    },
+    "off_topic": {
+      "n": 8,
+      "min": 0.8152,
+      "p05": 0.8168,
+      "p50": 0.8251,
+      "p95": 0.8417,
+      "max": 0.8425
+    }
+  },
+  "auc_in_domain_vs_unanswerable": 0.888,
+  "auc_in_domain_vs_off_topic": 0.9995,
+  "recommended_threshold": 0.845,
+  "off_topic_refused": 1.0,
+  "real_questions_kept": 0.992,
+  "answerability_rail": {
+    "unanswerable_caught": 18,
+    "unanswerable_total": 18,
+    "false_positive_rate": 0.00083,
+    "false_positive_sample_size": 1200
+  },
+  "current_threshold": 0.845
+}
