@@ -232,10 +232,19 @@
           <option value="eng_Latn">evidence: English only</option>
           <option value="hin_Deva">evidence: Hindi only</option>
         </select>
+        <select id="sttlang" title="Spoken language">
+          <option value="hi-IN">🎙 हिन्दी</option>
+          <option value="en-IN">🎙 English</option>
+        </select>
         <button class="mic" id="mic" title="Record a spoken question">🎙</button>
         <button class="go" id="ask">Ask</button>
       </div>
       <div class="chips" id="samples"></div>
+      <div class="muted hidden" id="micnote" style="margin-top:10px;font-size:12.5px">
+        ⚠️ No Sarvam key configured — the mic is using <b>your browser's</b> speech
+        recognition (Chrome/Edge). Set <code>SARVAM_API_KEY</code> to route audio through
+        Sarvam Saarika server-side, which is the path the pipeline is built for.
+      </div>
       <div class="dial">
         <label>Latency budget: <b id="budget-val">200</b> ms
           — shrink it and the harness sheds optional work instead of overrunning</label>
@@ -358,7 +367,18 @@ async function boot() {
       `voice <b>${HEALTH.voice_enabled ? "on" : "off"}</b> · ` +
       `LLM <b>${HEALTH.grounded_enabled ? esc(HEALTH.llm_model || "on") : "off"}</b> · ` +
       `lab <b>${HEALTH.lab_enabled ? HEALTH.lab_strategies + " strategies" : "not built"}</b>`;
-    if (!HEALTH.voice_enabled) $("mic").disabled = true;
+    // Server-side Sarvam is the real path (and what the brief requires). When
+    // it isn't configured, fall back to the browser's own speech recogniser so
+    // the mic still works for a demo instead of being a dead button.
+    if (!HEALTH.voice_enabled) {
+      if (BROWSER_STT) {
+        $("mic").title = "Sarvam key not set — using your browser's speech recognition";
+        $("micnote").classList.remove("hidden");
+      } else {
+        $("mic").disabled = true;
+        $("mic").title = "No Sarvam key, and this browser has no speech recognition (try Chrome)";
+      }
+    }
   } catch (e) {
     $("status-line").innerHTML = `<span class="err">service not ready: ${esc(e.message)}</span>`;
   }
@@ -541,7 +561,42 @@ async function attack(q, label) {
 }
 
 /* ---------------- voice ---------------- */
-let recorder = null, chunks = [], recording = false;
+const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+const BROWSER_STT = !!SR;
+let recorder = null, chunks = [], recording = false, browserRec = null;
+
+/* Browser speech recognition — used only when the server has no STT provider.
+   Chrome/Edge implement this; Firefox does not. */
+function browserListen() {
+  if (browserRec) { browserRec.stop(); return; }
+  const rec = new SR();
+  rec.lang = $("sttlang").value;
+  rec.interimResults = true;
+  rec.maxAlternatives = 1;
+  browserRec = rec;
+  $("mic").classList.add("rec"); $("mic").textContent = "◼";
+  $("ask-status").textContent = "listening… speak now";
+  let finalText = "";
+  rec.onresult = e => {
+    let interim = "";
+    for (let i = e.resultIndex; i < e.results.length; i++) {
+      const t = e.results[i][0].transcript;
+      if (e.results[i].isFinal) finalText += t; else interim += t;
+    }
+    $("q").value = (finalText + interim).trim();
+    $("ask-status").textContent = "heard: " + $("q").value;
+  };
+  rec.onerror = ev => {
+    $("ask-status").innerHTML = `<span class="err">speech error: ${esc(ev.error)}</span>`;
+  };
+  rec.onend = () => {
+    browserRec = null;
+    $("mic").classList.remove("rec"); $("mic").textContent = "🎙";
+    if ($("q").value.trim()) { $("ask-status").textContent = ""; ask(); }
+    else $("ask-status").textContent = "didn't catch anything — try again";
+  };
+  rec.start();
+}
 async function toggleMic() {
   if (recording) { recorder && recorder.stop(); return; }
   try {
@@ -595,7 +650,7 @@ async function refreshStats() {
 $("ask").onclick = ask;
 $("labgo").onclick = race;
 $("advgo").onclick = () => { const q = $("advq").value.trim(); if (q) attack(q, "custom"); };
-$("mic").onclick = toggleMic;
+$("mic").onclick = () => (HEALTH.voice_enabled ? toggleMic() : browserListen());
 $("q").addEventListener("keydown", e => e.key === "Enter" && ask());
 $("labq").addEventListener("keydown", e => e.key === "Enter" && race());
 $("advq").addEventListener("keydown", e => e.key === "Enter" && $("advgo").click());
