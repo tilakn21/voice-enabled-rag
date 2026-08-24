@@ -24,10 +24,11 @@ from fastapi.responses import FileResponse, JSONResponse
 
 from .config import PROJECT_ROOT, get_settings
 from .embeddings import Encoder
+from .exporting import EXPORT_DIR, export_answers, list_exports
 from .lab import ChunkingLab
 from .pipeline import RagService
 from .retrieval import Retriever
-from .schemas import QueryRequest, QueryResponse
+from .schemas import ExportRequest, QueryRequest, QueryResponse
 from .stt import build_stt
 from .telemetry import Timer
 
@@ -233,6 +234,40 @@ async def voice_query(
         detected_language=transcript.language,
         stt_ms=stt_ms,
     )
+
+
+# --------------------------------------------------------------------------
+# Export
+# --------------------------------------------------------------------------
+@app.post("/v1/export")
+async def export(request: ExportRequest):
+    """Write answers to data/exports/ and report where they landed."""
+    try:
+        return export_answers(request.answers, request.format)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/v1/exports")
+async def exports_index():
+    return {"directory": str(EXPORT_DIR), "files": list_exports()}
+
+
+@app.get("/v1/exports/{filename}")
+async def export_download(filename: str):
+    """Serve a previously written export.
+
+    `filename` comes from the URL, so it is matched against the actual
+    directory listing rather than being joined onto a path — a name like
+    `../../.env` can never resolve to anything outside the export folder
+    because it simply will not appear in the listing.
+    """
+    allowed = {f["filename"] for f in list_exports(limit=1000)}
+    if filename not in allowed:
+        raise HTTPException(status_code=404, detail="No such export.")
+    path = EXPORT_DIR / filename
+    media = "text/markdown" if filename.endswith(".md") else "application/json"
+    return FileResponse(path, media_type=media, filename=filename)
 
 
 # --------------------------------------------------------------------------

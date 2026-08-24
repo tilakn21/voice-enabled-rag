@@ -116,6 +116,18 @@ class QueryRequest(BaseModel):
     budget_ms: float | None = None
 
 
+class ExportRequest(BaseModel):
+    """Export one answer or a whole session to disk.
+
+    `answers` are QueryResponse payloads echoed back by the client. They are
+    written out verbatim rather than re-derived, so an export always matches
+    exactly what the user was shown.
+    """
+
+    answers: list[dict] = Field(default_factory=list)
+    format: Literal["md", "json"] = "md"
+
+
 class Citation(BaseModel):
     chunk_id: str
     doc_id: str
